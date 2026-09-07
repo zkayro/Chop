@@ -16,6 +16,14 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from boundary_engine import (
+    apply_to_candidates as apply_claim_aware_boundaries,
+    find_natural_ending as engine_find_natural_ending,
+    resolve_boundaries,
+    align_start_to_words,
+    align_end_to_words,
+)
+
 st.set_page_config(
     page_title="mariundjenson",
     page_icon="🎬",
@@ -2548,7 +2556,7 @@ def load_multimodal_candidates(project_dir, segments):
             local_score = int(item.get("local_multimodal_score", 0))
         except (KeyError, TypeError, ValueError):
             continue
-        if not text or end <= start or not 15 <= end - start <= 60.5:
+        if not text or end <= start or not 15 <= end - start <= 65.5:
             continue
         candidates.append({
             "start": start,
@@ -2578,7 +2586,23 @@ def load_multimodal_candidates(project_dir, segments):
             "anchor_strengths": item.get("anchor_strengths", {}),
             "surrounding_context": surrounding_context_summary(segments, start, end),
         })
-    return candidates or build_clip_candidates(segments)[:15]
+    if not candidates:
+        return build_clip_candidates(segments)[:15]
+
+    # Claim-aware boundary resolution only — does not change ranking/selection logic.
+    transcript = load_transcript(project_dir) or {}
+    boundary_context = build_boundary_context(project_dir, transcript)
+    if not boundary_context.get("segments"):
+        boundary_context["segments"] = [
+            {
+                "start": float(s["start"]),
+                "end": float(s["end"]),
+                "text": str(s.get("text", "")).strip(),
+            }
+            for s in segments
+            if float(s.get("end", 0) or 0) > float(s.get("start", 0) or 0)
+        ]
+    return apply_claim_aware_boundaries(candidates, boundary_context, dedupe=True) or candidates
 
 
 def candidate_debug_frame_times(candidate, analysis_features):
@@ -3152,6 +3176,19 @@ def build_boundary_context(project_dir, transcript_data):
                 "text": str(segment.get("text", "")).strip(),
             })
 
+    transcript_words = []
+    for word in transcript_data.get("words", []) or []:
+        if not isinstance(word, dict):
+            continue
+        try:
+            start = float(word.get("start", -1))
+            end = float(word.get("end", -1))
+        except (TypeError, ValueError):
+            continue
+        token = str(word.get("word", word.get("text", ""))).strip()
+        if token and end > start >= 0:
+            transcript_words.append({"word": token, "start": start, "end": end})
+
     try:
         duration = float(transcript_data.get("duration") or 0)
     except (TypeError, ValueError):
@@ -3175,46 +3212,23 @@ def build_boundary_context(project_dir, transcript_data):
     return {
         "duration": duration,
         "segments": transcript_segments,
+        "words": transcript_words,
         "scene_changes": sorted(scene_changes),
     }
 
 
-def find_natural_ending(original_end, boundary_context):
-    """Choose the earliest useful existing endpoint, at most 15s later."""
-    duration = float(boundary_context.get("duration") or 0)
-    latest = original_end + 15.0
-    if duration > 0:
-        latest = min(latest, duration)
-    if latest <= original_end:
-        return original_end
-
-    following = [
-        segment for segment in boundary_context.get("segments", [])
-        if original_end < segment["end"] <= latest
-    ]
-
-    # Prefer a completed spoken sentence.
-    for segment in following:
-        if segment["text"].rstrip().endswith((".", "!", "?", "。", "！", "？")):
-            return segment["end"]
-
-    # Then prefer a clear pause between existing Whisper segments.
-    all_segments = boundary_context.get("segments", [])
-    for position, segment in enumerate(all_segments[:-1]):
-        if original_end < segment["end"] <= latest:
-            next_segment = all_segments[position + 1]
-            if next_segment["start"] - segment["end"] >= 0.65:
-                return segment["end"]
-
-    # A known scene boundary is the next-best visual endpoint.
-    for event_time in boundary_context.get("scene_changes", []):
-        if original_end < event_time <= latest:
-            return event_time
-
-    # Any Whisper segment end is still safer than an arbitrary mid-sentence cut.
-    if following:
-        return following[0]["end"]
-    return original_end
+def find_natural_ending(original_end, boundary_context, clip=None):
+    """Recompute semantic completion via the shared claim-aware boundary engine."""
+    start = float((clip or {}).get("start", 0.0) or 0.0)
+    claim = (clip or {}).get("central_claim")
+    variant = (clip or {}).get("variant_type") or (clip or {}).get("region_type") or "STANDARD"
+    return engine_find_natural_ending(
+        start,
+        float(original_end),
+        boundary_context,
+        central_claim=claim if isinstance(claim, dict) else None,
+        variant_mode=str(variant),
+    )
 
 
 def apply_boundary_mode(clip, mode, boundary_context):
@@ -3234,7 +3248,21 @@ def apply_boundary_mode(clip, mode, boundary_context):
     elif mode == "End +10s":
         end += 10.0
     elif mode == "Expand to natural ending":
-        end = find_natural_ending(original_end, boundary_context)
+        # Same claim-aware engine: preserve start, recompute end (expand or shrink).
+        resolved = resolve_boundaries(
+            clip,
+            words=boundary_context.get("words"),
+            segments=boundary_context.get("segments"),
+            scene_changes=boundary_context.get("scene_changes"),
+            source_duration=boundary_context.get("duration"),
+            preserve_start=True,
+            end_only=True,
+        )
+        start = float(resolved["start"])
+        end = float(resolved["end"])
+        adjusted["boundary_debug"] = resolved.get("boundary_debug")
+        if resolved.get("text"):
+            adjusted["text"] = resolved["text"]
 
     duration = float(boundary_context.get("duration") or 0)
     start = max(0.0, start)
@@ -3242,6 +3270,14 @@ def apply_boundary_mode(clip, mode, boundary_context):
         end = min(end, duration)
     if end <= start:
         start, end = original_start, original_end
+
+    # Manual nudges still must never cut a word when word timings exist.
+    if mode not in {"Expand to natural ending", "Original"}:
+        words = boundary_context.get("words") or []
+        start = align_start_to_words(start, words)
+        end = align_end_to_words(end, words, source_duration=duration or None)
+        if end <= start:
+            start, end = original_start, original_end
 
     adjusted.update({
         "start": round(start, 3),

@@ -198,8 +198,19 @@ class SemanticPassTests(unittest.TestCase):
             "start": 10, "end": 30, "text": "Complete semantic idea.",
             "candidate_source": "semantic", "semantic_interest_score": .7,
             "local_multimodal_score": 70, "region_id": "semantic_2", "region_type": "SHORT"}]}
-        env = {"json": json, "build_clip_candidates": lambda _: [],
-               "surrounding_context_summary": lambda *args: {}}
+        def _passthrough_boundaries(candidates, boundary_context, dedupe=True):
+            return list(candidates)
+
+        env = {
+            "json": json,
+            "build_clip_candidates": lambda _: [],
+            "surrounding_context_summary": lambda *args: {},
+            "load_transcript": lambda _project_dir: {"segments": [], "words": [], "duration": 100},
+            "build_boundary_context": lambda _project_dir, _transcript: {
+                "duration": 100, "segments": [], "words": [], "scene_changes": [],
+            },
+            "apply_claim_aware_boundaries": _passthrough_boundaries,
+        }
         exec(compile(ast.Module(body=[node], type_ignores=[]), "adapter", "exec"), env)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
