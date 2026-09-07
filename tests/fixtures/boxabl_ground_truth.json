@@ -1,0 +1,12 @@
+{
+  "project_id": "20260907T100518Z_76efee8f",
+  "source_url": "https://www.youtube.com/watch?v=KrahQlLAz44",
+  "note": "User-provided Klap intervals. Claim bounds are manual audit annotations, never detector inputs.",
+  "clips": [
+    {"id": 1, "start": 33.0, "end": 51.0, "central_claim": {"start": 33.22, "end": 37.88, "label": "Elon Musk was the first prototype recipient"}},
+    {"id": 2, "start": 930.0, "end": 973.0, "central_claim": {"start": 931.94, "end": 938.68, "label": "A home every 60 seconds versus four hours today"}},
+    {"id": 3, "start": 158.0, "end": 199.0, "central_claim": {"start": 167.32, "end": 182.26, "label": "Three-bedroom two-story prototype with a deck"}},
+    {"id": 4, "start": 580.0, "end": 620.0, "central_claim": {"start": 585.62, "end": 602.22, "label": "Lower logistics costs and self transport"}},
+    {"id": 5, "start": 59.0, "end": 99.0, "central_claim": {"start": 77.2, "end": 82.24, "label": "Assembly-line homes set up in less than an hour"}}
+  ]
+}

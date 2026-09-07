@@ -88,7 +88,7 @@ python -m venv .venv
 Scoring reads `transcript.json` and rates segments on the eight criteria above. In the
 reference setup an LLM agent does this in-loop (zero API cost); score it however you like.
 
-**3. Render** &#8594; cut + reframe (16:9 default; `--aspect 9:16` / `1:1`) + burnt captions + a `.png` poster &#8594; `C:\clips`:
+**3. Render** &#8594; cut + reframe (16:9 default; `--aspect 9:16` / `1:1`) + burnt captions + a `.png` poster &#8594; `<project>/clips`:
 
 ```bash
 .venv\Scripts\python render_clips.py work
@@ -120,6 +120,6 @@ Repurposing podcasts, interviews, webinars, lectures and long YouTube videos int
   (whisper.cpp + Vulkan was attempted for AMD but is unstable on RDNA3 &#8212; crashes or
   returns corrupted output).
 - **Captions** use a built-in ffmpeg ASS renderer (the PyPI `pycaps` is an empty stub).
-- Output folder is `C:\clips` &#8212; change `OUT_DIR` in `render_clips.py`.
+- The Streamlit app keeps each video isolated under `projects/<project_id>/`; rendered clips and posters are stored in that project's `clips` folder.
 
 <sub>Personal / educational use &#8212; you are responsible for the rights to any video you process.</sub>

@@ -3,9 +3,15 @@
 whisper.cpp/
 whisper_old/
 work/
+projects/
 build_msvc*/
 __pycache__/
 *.pyc
 *.onnx
 *.log
 *.sh
+
+*.webm
+desktop.ini
+Thumbs.db
+
