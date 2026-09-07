@@ -11,7 +11,25 @@ __pycache__/
 *.log
 *.sh
 
+# secrets
+.env
+.env.*
+
+# media / renders
 *.webm
+*.mp4
+*.mov
+*.mkv
+clips/
+renders/
+analysis_frames/
+
+# ranking / analysis caches outside projects/
+ai_ranking_cache.json
+analysis_features.json
+**/ai_ranking_cache.json
+**/analysis_features.json
+
+# OS junk
 desktop.ini
 Thumbs.db
-
