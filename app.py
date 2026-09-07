@@ -24,6 +24,16 @@ from boundary_engine import (
     align_end_to_words,
 )
 
+from ranking_calibration import (
+    apply_quality_guardrails as calibrated_quality_guardrails,
+    apply_score_confidence_caps as calibrated_score_confidence_caps,
+    calibrated_scoring_bands_prompt,
+    decide_publishability,
+    finalize_relative_ranks,
+    global_best_moments_prompt_block,
+    quality_tier_for_score as calibrated_quality_tier_for_score,
+)
+
 st.set_page_config(
     page_title="mariundjenson",
     page_icon="🎬",
@@ -38,7 +48,7 @@ BASE_DIR = Path(__file__).resolve().parent
 PROJECTS_DIR = BASE_DIR / "projects"
 ANALYSIS_PIPELINE_VERSION = "two-stage-v2"
 CANDIDATE_PIPELINE_VERSION = "region-variants-v2-semantic-v1"
-AI_RANKING_VERSION = "viral-short-v7-confidence-review"
+AI_RANKING_VERSION = "viral-short-v8-global-best-moments"
 AI_SCORING_CALIBRATION = AI_RANKING_VERSION
 AI_CARD_OUTPUT_VERSION = "content-card-v3-auto-hook"
 EXPERIMENTAL_REVIEW_SCORE_FLOOR = 30
@@ -1437,11 +1447,10 @@ def ai_scoring_schema(candidate_count):
                 "description": "ID of one supplied hook option, or null when none is strong.",
             },
             "relative_rank": {
-                "anyOf": [
-                    {"type": "integer", "minimum": 1, "maximum": candidate_count},
-                    {"type": "null"},
-                ],
-                "description": "Relative rank among KEEP candidates only; null for REJECT.",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": candidate_count,
+                "description": "Position among ALL candidates in this video (1 = best). Unique per candidate.",
             },
             "campaign_fit_score": {
                 "type": "integer", "minimum": 0, "maximum": 10,
@@ -1473,13 +1482,7 @@ def ai_scoring_schema(candidate_count):
 
 
 def quality_tier_for_score(score):
-    if score >= 85:
-        return "strong"
-    if score >= 75:
-        return "good"
-    if score >= 65:
-        return "experimental"
-    return "weak"
+    return calibrated_quality_tier_for_score(score)
 
 
 def candidate_evidence_summary(candidate, components):
@@ -1590,101 +1593,16 @@ def candidate_confidence(candidate, evidence):
 
 
 def apply_score_confidence_caps(candidate, components):
-    raw_score = sum(components.values())
-    evidence = candidate_evidence_summary(candidate, components)
-    confidence_score, confidence_breakdown = candidate_confidence(candidate, evidence)
-    score_cap = 100
-    cap_reasons = []
-    if evidence["transcript_dominant"] and raw_score > 84:
-        score_cap = 84
-        cap_reasons.append("transcript_dominant_max_84")
-    if raw_score > 90:
-        required_90_scores = (
-            components["hook"] >= 22
-            and components["retention"] >= 17
-            and components["payoff"] >= 13
-            and components["standalone"] >= 8
-        )
-        sufficient_evidence = (
-            evidence["strong_evidence_count"] >= 2
-            and len(evidence["independent_source_groups"]) >= 2
-            and confidence_score >= 0.90
-        )
-        if not required_90_scores or not sufficient_evidence:
-            score_cap = min(score_cap, 89)
-            cap_reasons.append("insufficient_independent_evidence_for_90_plus")
-    return {
-        "raw_score": raw_score,
-        "final_score": min(raw_score, score_cap),
-        "score_cap": score_cap,
-        "score_cap_reasons": cap_reasons,
-        "confidence_score": confidence_score,
-        "confidence_breakdown": confidence_breakdown,
-        "evidence": evidence,
-    }
+    return calibrated_score_confidence_caps(
+        candidate,
+        components,
+        evidence_fn=candidate_evidence_summary,
+        confidence_fn=candidate_confidence,
+    )
 
 
 def apply_quality_guardrails(candidate, components):
-    adjusted = dict(components)
-    penalties = []
-    text = " ".join(str(candidate.get("text") or "").lower().split())
-    intro_pattern = re.compile(
-        r"^(?:hey|hello|hi|welcome|what'?s up|good morning|hallo|hey leute|"
-        r"herzlich willkommen|guten morgen|willkommen)\b"
-    )
-    context_pattern = re.compile(
-        r"^(?:and then|like i said|as mentioned|this one|that |so yeah|"
-        r"und dann|wie gesagt|wie erwähnt|dieses hier|das |also ja)\b"
-    )
-    sponsor_terms = (
-        "sponsor", "sponsored by", "use my code", "link in the description",
-        "werbung", "rabattcode", "link in der beschreibung",
-    )
-    if intro_pattern.search(text) or any(term in text[:180] for term in sponsor_terms):
-        adjusted["hook"] = max(0, adjusted["hook"] - 12)
-        adjusted["retention"] = max(0, adjusted["retention"] - 5)
-        adjusted["standalone"] = max(0, adjusted["standalone"] - 2)
-        penalties.append("intro_or_promo")
-    if context_pattern.search(text):
-        adjusted["hook"] = max(0, adjusted["hook"] - 7)
-        adjusted["standalone"] = max(0, adjusted["standalone"] - 5)
-        penalties.append("missing_context")
-    dead_air = float(candidate.get("dead_air_ratio", 0) or 0)
-    if dead_air >= 0.16:
-        adjusted["pacing"] = max(0, adjusted["pacing"] - max(1, round(dead_air * 8)))
-        adjusted["retention"] = max(0, adjusted["retention"] - round(dead_air * 10))
-        penalties.append("dead_air")
-    unfinished_end = re.search(
-        r"\b(?:and|but|because|so|then|und|aber|weil|dass|also|dann)[,. ]*$",
-        text,
-    )
-    question_without_resolution = (
-        "?" in text
-        and not any(term in text for term in (
-            "because", "therefore", "the answer", "that's why",
-            "weil", "deshalb", "die antwort", "darum",
-        ))
-    )
-    if unfinished_end or question_without_resolution:
-        adjusted["payoff"] = max(0, adjusted["payoff"] - 7)
-        adjusted["retention"] = max(0, adjusted["retention"] - 3)
-        penalties.append("missing_payoff")
-    weak_evidence = not (
-        re.search(r"\b\d+(?:[.,]\d+)?%?\b", text)
-        or "?" in text or "!" in text
-        or any(term in text for term in (
-            "truth", "mistake", "problem", "never", "impossible", "surpris",
-            "wahrheit", "fehler", "problem", "niemals", "unmöglich", "überrasch",
-        ))
-        or float(candidate.get("local_interest_score", 0) or 0) >= 0.5
-        or candidate.get("audio", {}).get("energy_spikes", 0)
-    )
-    if weak_evidence and sum(adjusted.values()) >= 85:
-        adjusted["hook"] = min(adjusted["hook"], 17)
-        adjusted["emotion_novelty"] = min(adjusted["emotion_novelty"], 9)
-        adjusted["shareability"] = min(adjusted["shareability"], 6)
-        penalties.append("limited_viral_evidence")
-    return adjusted, penalties
+    return calibrated_quality_guardrails(candidate, components)
 
 
 def apply_ai_evaluations(candidates, evaluations, allow_synthetic_hook=True):
@@ -1719,17 +1637,18 @@ def apply_ai_evaluations(candidates, evaluations, allow_synthetic_hook=True):
                 raise ValueError(f"AI score outside allowed range: {field}")
         model_decision = evaluation["decision"]
         model_relative_rank = evaluation.get("relative_rank")
+        if model_relative_rank is None:
+            raise ValueError("AI candidate is missing relative_rank among the full set")
+        model_relative_rank = int(model_relative_rank)
+        if not 1 <= model_relative_rank <= len(candidates):
+            raise ValueError("AI relative_rank outside candidate set bounds")
+        keep_ranks.append(model_relative_rank)
         if model_decision == "KEEP":
-            if model_relative_rank is None:
-                raise ValueError("AI KEEP candidate has no relative_rank")
             if any(
                 not evaluation[field].strip()
                 for field in ("title", "viral_reason", "weakness")
             ):
                 raise ValueError("AI KEEP candidate contains an empty text field")
-            keep_ranks.append(int(model_relative_rank))
-        elif model_relative_rank is not None:
-            raise ValueError("AI REJECT candidate must have relative_rank null")
         if model_decision == "REJECT" and not evaluation["reject_reason"].strip():
             raise ValueError("AI REJECT candidate has no reject_reason")
         components = {
@@ -1788,24 +1707,18 @@ def apply_ai_evaluations(candidates, evaluations, allow_synthetic_hook=True):
         if components["retention"] == 7 and components["pacing"] <= 2:
             narrow_gate_failures.append("forward momentum is borderline")
 
-        if not severe_gate_failures and model_decision == "KEEP" and component_total >= 75:
-            decision = "KEEP"
-        elif not severe_gate_failures and (
-            component_total >= 60
-            or (component_total >= 55 and len(narrow_gate_failures) == 1)
-        ):
-            decision = "BORDERLINE"
-        else:
-            decision = "REJECT"
+        decision = decide_publishability(
+            model_decision=model_decision,
+            component_total_score=component_total,
+            severe_gate_failures=severe_gate_failures,
+            narrow_gate_failures=narrow_gate_failures,
+        )
 
         if decision == "REJECT":
             selected_hook = None
             hook_option_id = None
-            final_relative_rank = None
-        elif decision == "KEEP":
-            final_relative_rank = int(model_relative_rank)
-        else:
-            final_relative_rank = None
+        # relative_rank is among ALL candidates; finalized after the full batch.
+        final_relative_rank = int(model_relative_rank)
 
         def compact_text(value, maximum_words):
             return " ".join(str(value).strip().split()[:maximum_words])
@@ -1832,7 +1745,7 @@ def apply_ai_evaluations(candidates, evaluations, allow_synthetic_hook=True):
                         ),
                         (
                             "overall score below review range"
-                            if decision == "REJECT" and component_total < 60
+                            if decision == "REJECT" and component_total < 68
                             else ""
                         ),
                     ])
@@ -1848,6 +1761,7 @@ def apply_ai_evaluations(candidates, evaluations, allow_synthetic_hook=True):
                 "hook": components["hook"],
                 "retention": components["retention"],
                 "payoff": components["payoff"],
+                "emotion_novelty": components["emotion_novelty"],
                 "emotion_novelty_conflict": components["emotion_novelty"],
                 "standalone": components["standalone"],
                 "shareability": components["shareability"],
@@ -1887,17 +1801,10 @@ def apply_ai_evaluations(candidates, evaluations, allow_synthetic_hook=True):
         })
         ranked.append(ranked_clip)
     if len(keep_ranks) != len(set(keep_ranks)):
-        raise ValueError("AI KEEP candidates contain duplicate relative_rank values")
-    return sorted(
-        ranked,
-        key=lambda clip: (
-            {"KEEP": 0, "BORDERLINE": 1, "REJECT": 2}.get(
-                clip.get("decision"), 3
-            ),
-            clip.get("relative_rank") or len(candidates) + 1,
-            -int(clip.get("score", 0)),
-        ),
-    )
+        raise ValueError("AI candidates contain duplicate relative_rank values")
+    if set(keep_ranks) != set(range(1, len(candidates) + 1)):
+        raise ValueError("AI relative_rank values must cover every position in the set")
+    return finalize_relative_ranks(ranked)
 
 
 def _semantic_vectors(candidates):
@@ -2330,7 +2237,7 @@ def _ai_scoring_models():
             "Founder Story", "Debate", "Unexpected", "Other",
         ]
         selected_hook_option_id: int | None = Field(ge=1, le=5)
-        relative_rank: int | None = Field(ge=1)
+        relative_rank: int = Field(ge=1)
         campaign_fit_score: int = Field(ge=0, le=10)
 
     class ClipEvaluationBatch(BaseModel):
@@ -2370,22 +2277,24 @@ def build_ai_scoring_instructions(ranking_options=None):
         "Act as a strict human short-form editor making publish-or-discard decisions, not as a "
         "reviewer trying to find something positive in every excerpt.",
         objective,
+        global_best_moments_prompt_block(),
         "Evaluate every supplied candidate in this one batch. Compare the candidates against each "
-        "other before assigning final scores. First identify internally the 1-3 strongest moments, "
+        "other before assigning final scores. First identify internally the strongest moments, "
         "which candidates tell substantially the same story, which are only acceptable in isolation "
         "but clearly weaker in this set, and which a human editor would actually publish. Keep the "
         "absolute 0-100 standard, but calibrate scores and relative_rank against this video's complete "
         "candidate set. There is no quota: many or all candidates may be REJECT, and zero or one KEEP "
-        "is valid. Never keep a candidate just to fill a top five. KEEP means BEST PUBLISHABLE. A "
-        "REJECT may still receive honest non-zero component scores when it is USEFUL FOR HUMAN REVIEW; "
-        "do not collapse all rejected candidates to near zero merely because they were rejected.",
+        "is valid. Never keep a candidate just to fill a top five. KEEP means BEST PUBLISHABLE among "
+        "moments that clear the publish bar. A REJECT may still receive honest non-zero component "
+        "scores when it is USEFUL FOR HUMAN REVIEW; do not collapse all rejected candidates to near "
+        "zero merely because they were rejected.",
         "For every candidate decide decision KEEP or REJECT first. KEEP only when: (1) its first 1-2 "
         "seconds contain an understandable scroll-stop, or a credible supplied auto-hook improves an "
         "already strong segment; (2) it creates a concrete reason to continue through curiosity, story, "
         "conflict, surprise, a strong claim, unusual visuals/events, or real stakes; (3) it reaches a "
         "clear payoff such as a reveal, answer, reaction, punchline, result, or strong concluding claim; "
         "(4) it works mostly without knowledge of the source video; and (5) it contains enough genuine "
-        "content for a short.",
+        "content for a short AND is among the best moments relative to the full candidate set.",
         "REJECT candidates that are mainly setup, introductions, transitions, smalltalk, descriptions "
         "without payoff, generic information, weak reactions, context-dependent fragments, clips whose "
         "interesting event happens after the end, clips whose first interesting sentence arrives too "
@@ -2405,21 +2314,17 @@ def build_ai_scoring_instructions(ranking_options=None):
         "not automatically better. Audio and visual signals may raise or lower potential, but noisy motion "
         "alone is not meaningful and emotions must not be invented.",
         hook_rule,
-        "Score scroll-stop 0-25, retention/forward momentum 0-20, payoff 0-15, "
-        "emotion/novelty/conflict 0-15, standalone clarity 0-10, shareability/comment potential 0-10, "
-        "and pacing 0-5. Do not return overall_score; Python sums these seven components locally. A local "
-        "total below 70 is normally REJECT. A score of 75 may still be REJECT for no payoff, missing "
-        "context, a poor start, or being clearly weaker than this set. Reserve 90-100 for exceptionally "
-        "rare moments, 85-89 for immediately post-worthy clips, 78-84 for good clips, 70-77 for merely "
-        "usable clips, 60-69 for mediocre clips, and below 60 for weak clips.",
-        "Only KEEP candidates receive a positive relative_rank, with 1 as best; every REJECT must use "
-        "relative_rank null and a concrete reject_reason. KEEP must use an empty reject_reason. Titles must "
-        "be natural, specific, in the spoken language, and at most 8 words. viral_reason is at most 18 "
-        "words and weakness at most 12 words. Never repeat the transcript or include extended quotations.",
+        calibrated_scoring_bands_prompt(),
+        "Every candidate receives a positive unique relative_rank from 1 to N (1 is best across the full "
+        "set, including REJECT). REJECT still needs a concrete reject_reason; KEEP must use an empty "
+        "reject_reason. Titles must be natural, specific, in the spoken language, and at most 8 words. "
+        "viral_reason is at most 18 words and weakness at most 12 words. Never repeat the transcript or "
+        "include extended quotations.",
         "If campaign context exists, score campaign_fit_score 0-10 separately. Campaign relevance cannot "
         "raise the 100-point viral score or rescue a bad clip. Without campaign context, return 0. Return "
         "every candidate exactly once in the strict schema.",
     ))
+
 
 
 def rerank_candidates_with_openai(candidates, campaign=None, ranking_options=None):
